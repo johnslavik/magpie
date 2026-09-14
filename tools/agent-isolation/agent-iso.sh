@@ -61,18 +61,28 @@
 #   injected via a one-shot `--settings` merge — nothing on disk
 #   changes — and a stderr banner reports what was added.
 #
-# Worktree mode (`claude-iso -w` / `claude-iso --worktree`):
-#   Additive on top of the current-repo auto-allow above. When
-#   `-w` / `--worktree` is present in the args AND the wrapper is
-#   invoked from inside a git repo, claude-iso also grants read
-#   access to the *main* repo (resolved via
-#   `git rev-parse --git-common-dir`, so it works whether you
-#   launch from the main checkout or from a nested worktree).
-#   When run in the main repo, the toplevel and the main repo
-#   resolve to the same path and are deduped. Both paths ride
-#   into the session via a single `--settings` injection that
-#   Claude merges into the loaded settings stack at startup,
-#   before the sandbox is initialised.
+# Linked worktrees:
+#   Additive on top of the current-repo auto-allow above, and
+#   automatic — no flag needed. A linked worktree keeps its HEAD,
+#   index and objects under the *main* checkout's `.git/`, so a
+#   session launched in one cannot run `git` at all without read
+#   access to it. claude-iso resolves the main repo via
+#   `git rev-parse --git-common-dir` on every launch from inside a
+#   git repo and grants it alongside the working tree. Launched
+#   from the main checkout the two resolve to the same path and
+#   dedupe to one entry. Both paths ride into the session via a
+#   single `--settings` injection that Claude merges into the
+#   loaded settings stack at startup, before the sandbox is
+#   initialised.
+#
+#   This grant is read-only, and it is per-session. Write access to
+#   the worktree and to the shared git dir — what committing from a
+#   worktree needs — comes from the project-local allowlist that
+#   `sandbox-add-project-root.sh` maintains.
+#
+#   `-w` / `--worktree` stays accepted: for Claude it rides through
+#   to the CLI untouched, and for any other harness it is stripped
+#   from the argv as the control flag it used to be here.
 
 # Core: launch agent CLI "$1" (claude / opencode / …) in a clean environment.
 # The env-stripping below is identical for every agent — only the injected
@@ -183,11 +193,12 @@ agent_iso_run() {
   #   - cwd_toplevel: the working tree root of $PWD (always when
   #     inside a git repo). Lets Claude read the source the user
   #     just `cd`'d into.
-  #   - main_repo:    the parent of the main repo's .git dir; added
-  #     only when `-w`/`--worktree` is on the argv, so worktree
-  #     sessions can see the original checkout.
-  # When both resolve to the same path (no worktree, or `-w` from
-  # the main repo) they collapse to a single entry.
+  #   - main_repo:    the parent of the *common* .git dir — the main
+  #     checkout. Always added when inside a git repo: in a linked
+  #     worktree that directory holds the worktree's HEAD, index and
+  #     objects, so git is unusable without it.
+  # In the main checkout both resolve to the same path and collapse
+  # to a single entry.
   local cwd_toplevel
   cwd_toplevel="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || true)"
 
@@ -199,11 +210,12 @@ agent_iso_run() {
     esac
   done
 
-  # `-w` / `--worktree` is an agent-iso control flag understood only by the
-  # Claude sandbox-grant path below (it widens the allowRead set to the main
-  # repo). For any other harness it is meaningless, and forwarding it into the
-  # launched CLI's argv risks it being misparsed as a native flag. Strip it for
-  # non-Claude agents so the generic entry point stays transparent.
+  # `-w` / `--worktree` is meaningful only to Claude Code, which takes it on
+  # its own argv. For any other harness it is meaningless, and forwarding it
+  # into the launched CLI's argv risks it being misparsed as a native flag.
+  # Strip it for non-Claude agents so the generic entry point stays
+  # transparent. (The main-repo grant below no longer keys off this flag —
+  # it is resolved from git on every launch.)
   if [[ "$agent" != "claude" && "$has_worktree" -eq 1 ]]; then
     local -a _passargs=()
     for arg in "$@"; do
@@ -213,14 +225,10 @@ agent_iso_run() {
       esac
     done
     set -- "${_passargs[@]}"
-    # The main-repo git resolution below is Claude-only (settings injection is
-    # gated on `$agent == claude`), so once `-w` is stripped for a non-Claude
-    # agent there is nothing left to resolve — skip the git calls.
-    has_worktree=0
   fi
 
   local main_repo=""
-  if [[ "$has_worktree" -eq 1 ]]; then
+  if [[ -n "$cwd_toplevel" ]]; then
     local common_dir
     common_dir="$(git -C "$PWD" rev-parse --git-common-dir 2>/dev/null || true)"
     if [[ -n "$common_dir" ]]; then
@@ -228,7 +236,12 @@ agent_iso_run() {
         /*) ;;
         *) common_dir="$PWD/$common_dir" ;;
       esac
-      main_repo="$(cd "$(dirname "$common_dir")" 2>/dev/null && pwd)"
+      # Only a common dir that *is* a `.git` directory has a working
+      # tree above it. In a submodule it is `<super>/.git/modules/<n>`
+      # — no main checkout to grant, so leave it empty.
+      case "$common_dir" in
+        */.git) main_repo="$(cd "$(dirname "$common_dir")" 2>/dev/null && pwd)" ;;
+      esac
     fi
   fi
 

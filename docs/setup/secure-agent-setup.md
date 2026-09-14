@@ -693,13 +693,29 @@ Three scopes the harness merges, top to bottom:
 | Project (committed) | `<repo>/.claude/settings.json` | every contributor on the project | **No** — machine-specific abs paths would leak into the repo. |
 | Project (local, gitignored) | `<repo>/.claude/settings.local.json` | this machine, this checkout only | **Yes** — per-machine, per-project, never committed. |
 
-Worktrees handle themselves: each worktree has its own working
-tree (and so its own `.claude/` directory and its own
-`.claude/settings.local.json`). The helper writes each worktree's
-absolute path into **that worktree's own** settings.local.json,
-not into a shared file. When a session starts in worktree A, the
-harness reads worktree A's settings.local.json and sees the
-explicit allow for worktree A's root — nothing more.
+**Linked worktrees do not handle themselves.** A worktree has its
+own working tree, so it can have its own `.claude/` directory and
+its own `.claude/settings.local.json` — but that is not the file
+the harness reads for a session started there. Claude Code
+resolves project scope through the *shared* git directory, so for
+every linked worktree of a repo the project-scope files are the
+**main checkout's** `.claude/settings.json` and
+`.claude/settings.local.json`. (`/sandbox` toggled inside a
+worktree session persists there too — which is how a stale
+`[sandbox]` tag in the status line first surfaced the behaviour.)
+
+A worktree therefore needs two entries in the **main checkout's**
+`settings.local.json` to be usable under the sandbox:
+
+| Path | Why |
+|---|---|
+| `<worktree>` | its working tree — the source the session is there to edit |
+| `<main-checkout>/.git` | a linked worktree keeps its HEAD, index and objects under the main checkout's git dir, so without it every `git` command in the worktree fails |
+
+The helper writes both, and keeps writing each worktree's own
+`settings.local.json` as well, so a worktree stays self-describing
+if the harness ever changes how it resolves project scope. No
+other path in the main checkout is added to the allowlist.
 
 The committed project-scope `settings.json` is **never** modified
 by the helper; the user-scope `settings.json` and
@@ -793,9 +809,10 @@ sandbox-allowlist content via a PR.
 
 **5. No vector via the helper's inputs.**
 The helper takes paths exclusively from
-`git rev-parse --show-toplevel` and
-`git worktree list --porcelain` — both walk the operator's own
-local git state. The only paths added are working directories the
+`git rev-parse --show-toplevel`,
+`git rev-parse --git-common-dir` and
+`git worktree list --porcelain` — all three walk the operator's
+own local git state. The only paths added are working directories the
 operator has already created themselves with `git clone` /
 `git worktree add`. No command-line path argument; no
 environment-variable injection.
@@ -827,12 +844,19 @@ adopter project on the host; what it *writes* is project-local).
 The helper:
 
 - Resolves `git rev-parse --show-toplevel` in the current working
-  directory.
+  directory, and the main checkout via
+  `git rev-parse --git-common-dir`.
+- Without a flag, writes the current worktree's path into the
+  current worktree's `.claude/settings.local.json` — and, from a
+  linked worktree, that path plus `<main-checkout>/.git` into the
+  **main checkout's** `.claude/settings.local.json`, the file the
+  harness reads for that session.
 - With `--all-worktrees`, also enumerates
-  `git worktree list --porcelain` and writes a separate entry
-  into **each worktree's** own `.claude/settings.local.json`.
-- Without the flag, writes only the current worktree's path
-  into the current worktree's `.claude/settings.local.json`.
+  `git worktree list --porcelain` and runs the same pass per
+  worktree: each keeps its own file, and the main checkout's file
+  ends up listing the main checkout and every linked worktree. A
+  worktree whose directory has been deleted but not yet pruned is
+  skipped.
 - Creates `.claude/settings.local.json` from scratch if missing
   (with only the `sandbox.filesystem` block — nothing else is
   touched).
@@ -861,9 +885,12 @@ The helper is invoked from four points in the framework's lifecycle:
 4. **Per worktree, on creation — where a `post-checkout` hook
    exists.** `git worktree add` fires `post-checkout` in the new
    working tree; the hook runs the helper *without*
-   `--all-worktrees`, so the new worktree lands its own abs path
-   in its own `.claude/settings.local.json` with no operator
-   action.
+   `--all-worktrees`, so the new worktree lands its abs path in
+   its own `.claude/settings.local.json` **and** in the main
+   checkout's, with no operator action. The hook treats the repo
+   as Claude-Code-aware when either the new tree or the main
+   checkout has a `.claude/` directory — a freshly created
+   worktree has none of its own, `.claude/` being gitignored.
 
    Two things install such a hook, and a host may have **neither**:
    `/magpie-setup install` writes a repo-local one **on the pinned
@@ -1121,16 +1148,24 @@ right answer for plain `claude` launches — the harness can't
 see the wrapper's argv.) Outside a git repo, this is a silent
 no-op.
 
-**Worktree mode (`claude-iso -w` / `claude-iso --worktree`).**
-Additive on top of the current-repo auto-allow. When `-w` is on
-the argv and `$PWD` is a worktree, the *main* repo (resolved via
-`git rev-parse --git-common-dir`) is also added — that path is
-otherwise unreachable from a worktree session, because the
-sandbox's relative `.` rule covers only the worktree itself.
-Run inside the main repo, `-w` is effectively a no-op: the
-working-tree root and the main repo resolve to the same path
-and dedupe into a single `allowRead` entry. Both paths ride
-into the session via a single `--settings` injection.
+**Main checkout of a linked worktree (always on).** Additive on
+top of the current-repo auto-allow, and automatic — it needs no
+flag. Whenever `claude-iso` is launched from inside a git working
+tree, the main checkout (resolved via
+`git rev-parse --git-common-dir`) is added as well. From a linked
+worktree that path is otherwise unreachable, and unreachable means
+`git` itself does not work: a worktree's HEAD, index and objects
+all live under the main checkout's `.git/`. Launched inside the
+main checkout the two resolve to the same path and dedupe into a
+single `allowRead` entry. Both paths ride into the session via a
+single `--settings` injection.
+
+`-w` / `--worktree` used to be what turned this on. It no longer
+gates anything here: for Claude it rides through to the CLI
+untouched, and for any other harness it is stripped from the argv.
+The grant is read-only and per-session — write access for a
+worktree session comes from
+[the project-local allowlist](#project-root-coverage-in-the-sandbox-allowlists).
 
 ## Sandbox-bypass visibility hook
 
@@ -1476,10 +1511,15 @@ another when several are open across worktrees and repos:
 [sandbox] magpie | feat/status-line * +2 | #1211 Add the agent-guard walkthrough step | Opus 5
 ```
 
-- **the project folder**, colour-coded by a stable hash of its name, so
-  a repo keeps the same colour across sessions — and a Claude Code
-  worktree renders as `<source>/<worktree>` with each half hashed
-  independently;
+- **the project folder** — the repo, not the current directory —
+  colour-coded by a stable hash of its name, so a repo keeps the same
+  colour across sessions, subdirectories and worktrees. A linked
+  worktree renders as `<repo>/<worktree>` with each half hashed
+  independently; the second half drops the repo prefix worktree
+  directories conventionally carry (`<repo>.<slug>` from worktree
+  managers, `<repo>-<slug>` from a plain `git worktree add`), and a
+  Claude Code worktree (`<source>/.claude/worktrees/<name>`) renders
+  the same way;
 - **the git branch**, with a dirty marker and ahead/behind against the
   upstream — read from local refs only, no network;
 - **the PR**, number and title, from one cached `gh pr view` per
@@ -1499,6 +1539,16 @@ that sets the key (to `true` *or* `false`). The `/sandbox`
 slash-command toggle persists to project `settings.local.json`,
 so flipping it mid-session is reflected in the prefix on the
 next render.
+
+**Project scope is the main checkout**, resolved through the
+shared git directory exactly as the harness resolves it — see
+[Linked worktrees do not handle themselves](#why-project-local-not-user-scope-and-not-committed-project).
+Reading `<cwd>/.claude/` instead is what produced a stale tag: in
+a linked worktree the per-worktree settings file carries only the
+sandbox filesystem allowlist and no `enabled` key, so the walk
+fell through to user scope and painted a green `[sandbox]` on a
+session the `/sandbox` panel reported as **No Sandbox**. A session
+started in a subdirectory of a repo fell through the same way.
 
 Like the [Sandbox-bypass visibility hook](#sandbox-bypass-visibility-hook),
 this is **complementary**, not authoritative — see Trade-offs

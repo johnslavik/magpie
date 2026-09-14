@@ -32,12 +32,16 @@
 # One responsibility, best-effort + idempotent + `|| true` so the
 # hook never breaks the surrounding git operation:
 #
-#   **Sandbox-allowlist for the current worktree.** If the working
-#   tree has a `.claude/` directory (i.e. it is Claude-Code-aware)
-#   and the framework's `sandbox-add-project-root.sh` helper is
-#   installed at `~/.claude/scripts/`, the hook calls the helper
-#   to populate `<worktree>/.claude/settings.local.json` with the
-#   worktree's absolute path. Defensive against the harness
+#   **Sandbox-allowlist for the current worktree.** If the repo is
+#   Claude-Code-aware (a `.claude/` directory in this working tree
+#   *or* in the main checkout — a freshly-created worktree has none
+#   of its own yet, the directory being gitignored) and the
+#   framework's `sandbox-add-project-root.sh` helper is installed at
+#   `~/.claude/scripts/`, the hook calls the helper to populate
+#   `<worktree>/.claude/settings.local.json` with the worktree's
+#   absolute path. From a linked worktree the helper also writes the
+#   main checkout's `settings.local.json`, which is the file Claude
+#   Code reads for a worktree session. Defensive against the harness
 #   behaviour documented at
 #   https://github.com/apache/magpie/issues/197 .
 #
@@ -78,9 +82,35 @@ if [ -z "$worktree" ]; then
   exit 0
 fi
 
+# Is this repo Claude-Code-aware? A worktree that `git worktree add`
+# just created has no `.claude/` of its own — the directory is
+# gitignored by convention — so fall back to asking the main checkout,
+# reached through the shared git dir.
+claude_aware=0
+[ -d "$worktree/.claude" ] && claude_aware=1
+
+if [ "$claude_aware" -eq 0 ]; then
+  common_dir=$(git rev-parse --git-common-dir 2>/dev/null || true)
+  if [ -n "$common_dir" ]; then
+    case "$common_dir" in
+      /*) ;;
+      *) common_dir="$PWD/$common_dir" ;;
+    esac
+    # `<super>/.git/modules/<name>` in a submodule — no main checkout
+    # above it, so only a real `.git` common dir answers here.
+    main_root=""
+    case "$common_dir" in
+      */.git) main_root=$(cd "$(dirname "$common_dir")" 2>/dev/null && pwd) || main_root="" ;;
+    esac
+    if [ -n "$main_root" ] && [ -d "$main_root/.claude" ]; then
+      claude_aware=1
+    fi
+  fi
+fi
+
 # Sandbox-allowlist helper
 if [ -x "$HOME/.claude/scripts/sandbox-add-project-root.sh" ] \
-    && [ -d "$worktree/.claude" ]; then
+    && [ "$claude_aware" -eq 1 ]; then
   "$HOME/.claude/scripts/sandbox-add-project-root.sh" 2>/dev/null || true
 fi
 

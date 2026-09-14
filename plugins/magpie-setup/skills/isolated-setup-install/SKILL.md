@@ -350,8 +350,12 @@ Run the helper once with `--all-worktrees` in the adopter
 repo's main checkout. The helper enumerates
 `git worktree list --porcelain` and, for each worktree, writes
 that worktree's absolute path into that worktree's own
-`<worktree>/.claude/settings.local.json` (creating the file if
-it does not yet exist). Idempotent, atomic, tolerant of missing
+`<worktree>/.claude/settings.local.json` **and** into the main
+checkout's — the file Claude Code reads for a worktree session,
+since project scope resolves through the shared git dir — along
+with `<main-checkout>/.git`, which holds every linked worktree's
+HEAD, index and objects (creating the files if they do not yet
+exist). Idempotent, atomic, tolerant of missing
 prereqs (see the script's header comment for the full
 failure-mode list). On success, surface the diff so the operator
 sees which entries landed; on no-op (paths already present),

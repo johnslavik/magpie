@@ -345,6 +345,161 @@ class TestGitignoreSafetyCheck:
 
 
 # ---------------------------------------------------------------------------
+# linked worktrees
+# ---------------------------------------------------------------------------
+
+
+def _committed_repo(tmp_path: Path) -> Path:
+    """A git repo with one commit, so worktrees can be added to it."""
+    repo = _make_git_repo(tmp_path)
+    subprocess.run(["git", "-C", str(repo), "add", ".gitignore"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.email=t@e.st", "-c", "user.name=t",
+         "-c", "commit.gpgsign=false", "commit", "-m", "init"],
+        check=True,
+        capture_output=True,
+    )
+    return repo
+
+
+def _add_worktree(repo: Path, path: Path, branch: str) -> Path:
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", str(path), "-b", branch],
+        check=True,
+        capture_output=True,
+    )
+    return path
+
+
+class TestLinkedWorktrees:
+    """Project scope for a linked worktree is the *main* worktree.
+
+    Claude Code resolves project-scope settings through the shared git
+    directory, so a session started in a linked worktree reads the main
+    checkout's `.claude/settings.local.json`. Entries written only to the
+    worktree's own file are never seen by that session — the worktree's
+    tree, and the shared git dir it keeps its HEAD and objects in, have
+    to be listed in the main worktree's file as well.
+    """
+
+    def test_worktree_path_lands_in_main_settings(self, tmp_path: Path) -> None:
+        repo = _committed_repo(tmp_path)
+        # Name the worktree the way worktree managers do: `<repo>.<slug>`.
+        wt = _add_worktree(repo, tmp_path / "repo.feature", "feature")
+
+        _run(wt, extra_env=_no_global_git_config(tmp_path))
+
+        data = _load(repo / ".claude" / "settings.local.json")
+        assert str(wt) in data["sandbox"]["filesystem"]["allowRead"]
+        assert str(wt) in data["sandbox"]["filesystem"]["allowWrite"]
+
+    def test_shared_git_dir_lands_in_main_settings(self, tmp_path: Path) -> None:
+        repo = _committed_repo(tmp_path)
+        wt = _add_worktree(repo, tmp_path / "repo.feature", "feature")
+
+        _run(wt, extra_env=_no_global_git_config(tmp_path))
+
+        data = _load(repo / ".claude" / "settings.local.json")
+        assert str(repo / ".git") in data["sandbox"]["filesystem"]["allowRead"]
+        assert str(repo / ".git") in data["sandbox"]["filesystem"]["allowWrite"]
+
+    def test_worktree_keeps_its_own_settings_file(self, tmp_path: Path) -> None:
+        repo = _committed_repo(tmp_path)
+        wt = _add_worktree(repo, tmp_path / "repo.feature", "feature")
+
+        _run(wt, extra_env=_no_global_git_config(tmp_path))
+
+        data = _load(wt / ".claude" / "settings.local.json")
+        assert data["sandbox"]["filesystem"]["allowRead"] == [str(wt)]
+
+    def test_works_from_the_hook_environment(self, tmp_path: Path) -> None:
+        """The post-checkout hook fires with GIT_DIR exported."""
+        repo = _committed_repo(tmp_path)
+        wt = _add_worktree(repo, tmp_path / "repo.feature", "feature")
+
+        result = _run(
+            wt, extra_env={**_no_global_git_config(tmp_path), "GIT_DIR": _git_dir_of(wt)}
+        )
+
+        assert result.returncode == 0
+        data = _load(repo / ".claude" / "settings.local.json")
+        assert str(wt) in data["sandbox"]["filesystem"]["allowRead"]
+
+    def test_main_checkout_run_adds_only_its_own_root(self, tmp_path: Path) -> None:
+        """Run from the main checkout there is no linked worktree in play."""
+        repo = _committed_repo(tmp_path)
+
+        _run(repo, extra_env=_no_global_git_config(tmp_path))
+
+        data = _load(repo / ".claude" / "settings.local.json")
+        assert data["sandbox"]["filesystem"]["allowRead"] == [str(repo)]
+
+    def test_all_worktrees_collects_every_tree_in_main_settings(self, tmp_path: Path) -> None:
+        repo = _committed_repo(tmp_path)
+        one = _add_worktree(repo, tmp_path / "repo.one", "one")
+        two = _add_worktree(repo, tmp_path / "repo.two", "two")
+
+        _run(one, args=["--all-worktrees"], extra_env=_no_global_git_config(tmp_path))
+
+        allow_read = _load(repo / ".claude" / "settings.local.json")["sandbox"]["filesystem"]["allowRead"]
+        assert str(repo) in allow_read
+        assert str(one) in allow_read
+        assert str(two) in allow_read
+        assert str(repo / ".git") in allow_read
+
+    def test_submodule_is_not_mistaken_for_a_worktree(self, tmp_path: Path) -> None:
+        """`<super>/.git/modules/<name>` has no working tree above it."""
+        super_repo = _committed_repo(tmp_path)
+        lib = tmp_path / "lib"
+        lib.mkdir()
+        subprocess.run(["git", "init", "-q", str(lib)], check=True, capture_output=True)
+        (lib / ".gitignore").write_text("/.claude/settings.local.json\n")
+        subprocess.run(["git", "-C", str(lib), "add", ".gitignore"], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(lib), "-c", "user.email=t@e.st", "-c", "user.name=t",
+             "-c", "commit.gpgsign=false", "commit", "-m", "init"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(super_repo), "-c", "protocol.file.allow=always",
+             "-c", "user.email=t@e.st", "-c", "user.name=t", "-c", "commit.gpgsign=false",
+             "submodule", "add", "-q", str(lib), "sub"],
+            check=True,
+            capture_output=True,
+        )
+
+        _run(super_repo / "sub", extra_env=_no_global_git_config(tmp_path))
+
+        data = _load(super_repo / "sub" / ".claude" / "settings.local.json")
+        assert data["sandbox"]["filesystem"]["allowRead"] == [str(super_repo / "sub")]
+        assert not (super_repo / ".git" / "modules" / ".claude").exists()
+
+    def test_deleted_worktree_is_skipped(self, tmp_path: Path) -> None:
+        """`git worktree list` reports a deleted worktree until pruned."""
+        repo = _committed_repo(tmp_path)
+        gone = _add_worktree(repo, tmp_path / "repo.gone", "gone")
+        shutil.rmtree(gone)
+
+        _run(repo, args=["--all-worktrees"], extra_env=_no_global_git_config(tmp_path))
+
+        allow_read = _load(repo / ".claude" / "settings.local.json")["sandbox"]["filesystem"]["allowRead"]
+        assert str(gone) not in allow_read
+        assert not gone.exists()
+
+    def test_second_run_adds_no_duplicates(self, tmp_path: Path) -> None:
+        repo = _committed_repo(tmp_path)
+        wt = _add_worktree(repo, tmp_path / "repo.feature", "feature")
+
+        _run(wt, extra_env=_no_global_git_config(tmp_path))
+        _run(wt, extra_env=_no_global_git_config(tmp_path))
+
+        allow_read = _load(repo / ".claude" / "settings.local.json")["sandbox"]["filesystem"]["allowRead"]
+        assert allow_read == sorted(set(allow_read), key=allow_read.index)
+        assert len(allow_read) == 2
+
+
+# ---------------------------------------------------------------------------
 # missing jq
 # ---------------------------------------------------------------------------
 

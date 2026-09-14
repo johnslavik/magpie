@@ -228,13 +228,16 @@ Walk each in order:
 
    - **Static:** for the current working tree, confirm its
      absolute path appears in both
-     `<worktree>/.claude/settings.local.json`'s
      `sandbox.filesystem.allowRead` and
-     `sandbox.filesystem.allowWrite`. For every other linked
-     worktree in `git worktree list --porcelain`, run the same
-     check against *that* worktree's own
-     `.claude/settings.local.json` — each worktree carries its
-     own entry. Surface ✗ on any missing entry; remediation:
+     `sandbox.filesystem.allowWrite` of the settings file the
+     harness reads for this session: the **main checkout's**
+     `.claude/settings.local.json` (project scope resolves
+     through the shared git dir, so that file governs the main
+     checkout and every linked worktree alike). For every linked
+     worktree in `git worktree list --porcelain`, check that its
+     path is listed there too, alongside `<main-checkout>/.git`.
+     Each worktree's own `.claude/settings.local.json` carries
+     its path as well. Surface ✗ on any missing entry; remediation:
      `~/.claude/scripts/sandbox-add-project-root.sh --all-worktrees`
      (or re-run `setup-isolated-setup-install` if the helper is
      not installed).

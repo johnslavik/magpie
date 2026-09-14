@@ -18,7 +18,7 @@
 > | Marketplace install, configured with [`config`](config.md) | the `.apache-magpie-local/` link — Step 0b |
 > | Pinned snapshot install, adopted or not | the snapshot link *and* the per-worktree skill symlinks — Steps 1 and 1b. Both are gitignored, so git brings neither |
 > | Self-adoption in the framework checkout | neither of those: here `skills/` and its relays are committed, so the checkout already has them |
-> | **Any of the above, under the secure sandbox** | this worktree's absolute path in its own gitignored `.claude/settings.local.json` — Step 1c |
+> | **Any of the above, under the secure sandbox** | this worktree's absolute path in the gitignored `.claude/settings.local.json` of the **main checkout** (the file the harness reads for a worktree session) and of the worktree itself — Step 1c |
 >
 > Two consequences worth stating plainly. **Adoption needs nothing here:**
 > the floor lock, the derived wiring and the project's configuration are
@@ -231,7 +231,9 @@ invoke it from the worktree's working directory (no
 `--all-worktrees` flag — only this one worktree needs adding;
 the helper picks up the current worktree's
 `git rev-parse --show-toplevel` and writes the abs path to
-`<this-worktree>/.claude/settings.local.json`):
+`<this-worktree>/.claude/settings.local.json` *and* to
+`<main-checkout>/.claude/settings.local.json`, together with
+`<main-checkout>/.git`):
 
 ```bash
 "$HOME/.claude/scripts/sandbox-add-project-root.sh"
@@ -242,13 +244,18 @@ the helper picks up the current worktree's
 `denyWithinAllow` set, so a sandboxed Bash write fails with
 `operation not permitted`. Surface the bypass proposal to the
 operator *before* invoking; name the helper and the target file
-(`<worktree>/.claude/settings.local.json`); confirm. Reason:
+(`<worktree>/.claude/settings.local.json` and
+`<main-checkout>/.claude/settings.local.json`); confirm. Reason:
 *"writing project-local sandbox-allowlist entry (issue #197
 fix)"*.
 
 The helper writes to **project-local** scope, not user-scope —
-each worktree carries its own `.claude/settings.local.json`
-entry, and the per-worktree file is gitignored. The helper is
+both files it touches are gitignored `.claude/settings.local.json`
+files. Two, not one, because Claude Code resolves project scope
+through the shared git dir: a session started in this worktree
+reads the *main checkout's* settings file, so that is where this
+worktree's path and the main checkout's `.git` (which holds this
+worktree's HEAD, index and objects) have to land. The helper is
 idempotent (no-op when already added) and exits 0 when
 prereqs are missing (no `jq`, not in a git repo). Surface a
 one-line recap row for the Step 2 summary:

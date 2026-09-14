@@ -31,9 +31,22 @@
 # stays in the project's committed `.claude/settings.json` —
 # the explicit absolute path is belt-and-braces.
 #
-# Scope: writes ONLY to project-local `<repo>/.claude/settings.local.json`,
-# never to user-scope (`~/.claude/settings.json`) and never to the
-# committed project-scope (`<repo>/.claude/settings.json`).
+# Linked worktrees. Claude Code resolves *project scope* through the
+# shared git directory, so a session started in a linked worktree reads
+# `<main-worktree>/.claude/settings.local.json` — not the worktree's own
+# file. (`/sandbox` toggled inside a worktree session writes there too.)
+# A worktree therefore needs its paths in the MAIN worktree's file to be
+# reachable at all, and it needs two of them: its own working tree, and
+# the main worktree's `.git` — a linked worktree keeps its HEAD, index
+# and objects under `<main>/.git/`, so without that entry every git
+# command in the worktree fails under the sandbox. This helper writes
+# both, and keeps writing the worktree's own file as well so a worktree
+# stays self-describing.
+#
+# Scope: writes ONLY to project-local `.claude/settings.local.json` files
+# — the current worktree's and, for a linked worktree, the main
+# worktree's — never to user-scope (`~/.claude/settings.json`) and never
+# to the committed project-scope (`<repo>/.claude/settings.json`).
 # - User-scope is shared across every project on the host; per-adopter
 #   paths there would pollute every session.
 # - Committed project-scope is shared across contributors; machine-
@@ -74,16 +87,21 @@
 #   via `git rev-parse --show-toplevel`, then writes/updates
 #   `<that-path>/.claude/settings.local.json` so its
 #   `sandbox.filesystem.allowRead` and `allowWrite` arrays contain
-#   the worktree's absolute path. Used by the `post-checkout` git
-#   hook installed by `/magpie-setup adopt` — when a new worktree
-#   is created, the hook fires in the new working tree and the
-#   helper writes that worktree's own settings.local.json.
+#   the worktree's absolute path. From a *linked* worktree it also
+#   adds that worktree's path and `<main-worktree>/.git` to the main
+#   worktree's `.claude/settings.local.json` — the file the harness
+#   actually reads for the session (see "Linked worktrees" above).
+#   Used by the `post-checkout` git hook installed by
+#   `/magpie-setup adopt` — when a new worktree is created, the hook
+#   fires in the new working tree and the helper wires up both files.
 # - All-worktrees mode (`--all-worktrees`): enumerates
 #   `git worktree list --porcelain` from the current repo and
-#   invokes the same write pass once per worktree, each against
-#   the worktree's own `.claude/settings.local.json`. Used by
-#   `setup-isolated-setup-install`, `/magpie-setup adopt`,
-#   `/magpie-setup upgrade`.
+#   invokes the same write pass once per worktree. The main
+#   worktree's settings file ends up listing the main checkout and
+#   every linked worktree; each linked worktree also keeps its own
+#   file. A worktree whose directory is gone but not yet pruned is
+#   skipped. Used by `setup-isolated-setup-install`,
+#   `/magpie-setup adopt`, `/magpie-setup upgrade`.
 # - The target file is created from scratch if it does not exist
 #   (only the `sandbox.filesystem` block is written; nothing else
 #   is touched). Existing files: idempotent, atomic (`jq` → tmp →
@@ -100,7 +118,8 @@
 # - /magpie-setup adopt + upgrade (with --all-worktrees from the main).
 # - /magpie-setup worktree-init (without the flag — current worktree only).
 # - The post-checkout git hook installed by /magpie-setup adopt
-#   (without the flag — only the new worktree's path).
+#   (without the flag — the new worktree, written to its own file and
+#   to the main worktree's).
 
 set -euo pipefail
 
@@ -113,7 +132,7 @@ while [ $# -gt 0 ]; do
     --all-worktrees) all_worktrees=1 ;;
     --dry-run)       dry_run=1 ;;
     -h|--help)
-      sed -n '19,103p' "$0"  # print the usage + behaviour block above
+      sed -n '19,122p' "$0"  # print the usage + behaviour block above
       exit 0
       ;;
     *)
@@ -143,41 +162,82 @@ if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
   exit 0
 fi
 
-# --- collect (worktree-path, settings-file) pairs ---------------------------
+# --- resolve the main worktree ----------------------------------------------
+
+# The parent of the *common* git dir: the same directory whether we are
+# invoked from the main checkout or from any linked worktree of it. This
+# is the project root Claude Code resolves for every session of the repo,
+# so it is where a linked worktree's allowlist entries have to land.
+# Only a common dir that *is* a `.git` directory has a working tree
+# above it. Inside a submodule it is `<super>/.git/modules/<name>`,
+# whose parent is no project root — leave main_root empty there and the
+# pass below degrades to the pre-worktree behaviour.
+main_root=""
+common_dir=$(git rev-parse --git-common-dir 2>/dev/null) || common_dir=""
+if [ -n "$common_dir" ]; then
+  case "$common_dir" in
+    /*) ;;
+    *) common_dir="$PWD/$common_dir" ;;
+  esac
+  case "$common_dir" in
+    */.git) main_root=$(cd "$(dirname "$common_dir")" 2>/dev/null && pwd) || main_root="" ;;
+  esac
+fi
+
+# --- collect (settings-file, allowlisted-path) pairs ------------------------
 
 # Pairs are stored as two parallel arrays — bash 3 (macOS default) has no
-# associative arrays we can rely on portably.
-worktree_paths=()
+# associative arrays we can rely on portably. One worktree can contribute
+# entries to two different settings files, so the de-dup key is the pair.
 target_files=()
+allow_paths=()
 
-add_pair() {
-  local wt="$1"
-  # Skip if we've already queued this worktree (de-dup in --all-worktrees mode).
-  local existing
-  for existing in "${worktree_paths[@]:-}"; do
-    [ "$existing" = "$wt" ] && return 0
+add_entry() {
+  local file="$1" path="$2" i=0
+  while [ "$i" -lt "${#target_files[@]}" ]; do
+    if [ "${target_files[$i]}" = "$file" ] && [ "${allow_paths[$i]}" = "$path" ]; then
+      return 0
+    fi
+    i=$((i + 1))
   done
-  worktree_paths+=("$wt")
-  target_files+=("$wt/.claude/settings.local.json")
+  target_files+=("$file")
+  allow_paths+=("$path")
+}
+
+add_worktree() {
+  local wt="$1"
+  # `git worktree list` keeps reporting worktrees whose directory has
+  # been deleted (until someone runs `git worktree prune`). Writing for
+  # one would recreate the directory tree and put a path that no longer
+  # exists into the allowlist, so skip it.
+  [ -d "$wt" ] || return 0
+  add_entry "$wt/.claude/settings.local.json" "$wt"
+  if [ -n "$main_root" ] && [ "$wt" != "$main_root" ]; then
+    # Linked worktree: the harness reads the main worktree's file for
+    # this session, so the worktree's own tree and the shared git dir
+    # have to be listed there to be in scope at all.
+    add_entry "$main_root/.claude/settings.local.json" "$wt"
+    add_entry "$main_root/.claude/settings.local.json" "$main_root/.git"
+  fi
 }
 
 if [ "$all_worktrees" -eq 1 ]; then
   while IFS= read -r line; do
     case "$line" in
       "worktree "*)
-        add_pair "${line#worktree }"
+        add_worktree "${line#worktree }"
         ;;
     esac
   done < <(git worktree list --porcelain)
 else
-  add_pair "$(git rev-parse --show-toplevel)"
+  add_worktree "$(git rev-parse --show-toplevel)"
 fi
 
 # --- update a single project-local settings file ----------------------------
 
-# update_settings <file> <project-root-abs-path>
+# update_settings <file> <abs-path>
 #
-# Ensure <project-root-abs-path> appears in `.sandbox.filesystem.allowRead`
+# Ensure <abs-path> appears in `.sandbox.filesystem.allowRead`
 # and `.sandbox.filesystem.allowWrite` of <file>. Atomic write.
 # Creates <file> + parent dir if missing.
 update_settings() {
@@ -300,14 +360,14 @@ update_settings() {
   fi
 
   mv "$tmp" "$file"
-  printf 'sandbox-add-project-root.sh: updated %s (project root: %s)\n' "$file" "$path" >&2
+  printf 'sandbox-add-project-root.sh: updated %s (allowed: %s)\n' "$file" "$path" >&2
 }
 
 # --- apply ------------------------------------------------------------------
 
 i=0
-while [ "$i" -lt "${#worktree_paths[@]}" ]; do
-  update_settings "${target_files[$i]}" "${worktree_paths[$i]}"
+while [ "$i" -lt "${#target_files[@]}" ]; do
+  update_settings "${target_files[$i]}" "${allow_paths[$i]}"
   i=$((i + 1))
 done
 

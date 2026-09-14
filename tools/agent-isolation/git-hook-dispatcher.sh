@@ -80,11 +80,40 @@ run_framework() {
   case "$hook" in
     post-checkout)
       # Sandbox-allowlist for the current worktree (issue #197).
-      local wt
+      #
+      # The "is this repo Claude-Code-aware?" test accepts a `.claude/`
+      # in this working tree *or* in the main checkout: a worktree that
+      # `git worktree add` just created has none of its own (the
+      # directory is gitignored by convention), and that is exactly the
+      # checkout whose allowlist needs writing.
+      local wt common_dir main_root aware
       wt="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-      if [ -n "$wt" ] \
-          && [ -x "$HOME/.claude/scripts/sandbox-add-project-root.sh" ] \
-          && [ -d "$wt/.claude" ]; then
+      common_dir=""
+      main_root=""
+      aware=0
+      if [ -n "$wt" ]; then
+        if [ -d "$wt/.claude" ]; then
+          aware=1
+        else
+          common_dir="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+          case "$common_dir" in
+            ""|/*) : ;;
+            *) common_dir="$PWD/$common_dir" ;;
+          esac
+          # `<super>/.git/modules/<name>` in a submodule — no main
+          # checkout above it, so only a real `.git` common dir answers.
+          case "$common_dir" in
+            */.git)
+              main_root="$(cd "$(dirname "$common_dir")" 2>/dev/null && pwd)" || main_root=""
+              if [ -n "$main_root" ] && [ -d "$main_root/.claude" ]; then
+                aware=1
+              fi
+              ;;
+          esac
+        fi
+      fi
+      if [ "$aware" -eq 1 ] \
+          && [ -x "$HOME/.claude/scripts/sandbox-add-project-root.sh" ]; then
         "$HOME/.claude/scripts/sandbox-add-project-root.sh" 2>/dev/null || true
       fi
       ;;

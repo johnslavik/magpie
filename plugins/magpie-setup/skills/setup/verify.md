@@ -439,15 +439,27 @@ Defensive cross-check for
 CWD under the harness, so `setup` (adopt, upgrade,
 worktree-init) chains into
 `~/.claude/scripts/sandbox-add-project-root.sh` to add explicit
-absolute paths to each worktree's own project-local settings.
-This check verifies that chain landed for the *current* worktree.
+absolute paths to the project-local settings files that govern
+this worktree. This check verifies that chain landed for the
+*current* worktree.
+
+Two files govern it, and in the main checkout they are one and
+the same. `<worktree>/.claude/settings.local.json` is the
+worktree's own; `<main-checkout>/.claude/settings.local.json` —
+the main checkout resolved via `git rev-parse --git-common-dir` —
+is what Claude Code actually reads for a session in **any**
+worktree of the repo, because project scope resolves through the
+shared git dir.
 
 For the current worktree (resolved via
 `git rev-parse --show-toplevel`):
 
 - ✓ if the absolute path appears in **both**
   `<worktree>/.claude/settings.local.json`'s
-  `sandbox.filesystem.allowRead` and `sandbox.filesystem.allowWrite`.
+  `sandbox.filesystem.allowRead` and `sandbox.filesystem.allowWrite`
+  — and, in a linked worktree, in the main checkout's file too,
+  alongside `<main-checkout>/.git` (where this worktree keeps its
+  HEAD, index and objects).
 - ✗ if missing from either array, **and** the helper script
   `~/.claude/scripts/sandbox-add-project-root.sh` is installed
   — remediation:
@@ -474,12 +486,12 @@ For the current worktree (resolved via
   Remediation: add `/.claude/settings.local.json` to the
   adopter's `.gitignore` (also surfaced by check 4 above).
 
-The check scopes to the current worktree only, not the full
-`git worktree list`, because each worktree carries its own
-project-local settings file — `setup verify` running
-in worktree A has no business asserting on worktree B's file
-(which it cannot even reliably read without crossing into
-another working tree's path).
+The check scopes to the current worktree's *path* only, not the
+full `git worktree list` — `setup verify` running in worktree A
+has no business asserting that worktree B is wired up (B may not
+even have been opened yet). It reads the main checkout's settings
+file because that is the file governing the session it is running
+in, not to audit anyone else's entry in it.
 
 This check is read-only on the framework state. The defence
 is layered: `setup` writes during adopt/upgrade,

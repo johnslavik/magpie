@@ -24,6 +24,7 @@ agent-iso.sh against it.  Verify which variables survive the
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import stat
@@ -269,3 +270,91 @@ class TestEdgeCases:
         # None of the secret values should appear in the captured output
         for val in creds.values():
             assert val not in res.stdout
+
+
+# ---------------------------------------------------------------------------
+# sandbox allowRead grant (current repo + main checkout of a worktree)
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_claude_argv(bin_dir: Path) -> None:
+    """A fake `claude` that echoes its argv, one argument per line."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    fake = bin_dir / "claude"
+    fake.write_text('#!/bin/sh\nfor a in "$@"; do echo "$a"; done\n')
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.email=t@e.st", "-c", "user.name=t",
+         "-c", "commit.gpgsign=false", *args],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _run_in(cwd: Path, bin_dir: Path, extra_args: list | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [BASH, str(SCRIPT)] + (extra_args or []),
+        env={
+            "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+            "HOME": str(bin_dir.parent / "home"),
+            "USER": "testuser",
+            "SHELL": "/bin/sh",
+            "TERM": "xterm",
+            "LANG": "en_US.UTF-8",
+        },
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+    )
+
+
+def _granted_paths(stdout: str) -> list:
+    """The allowRead paths out of the injected `--settings` argument."""
+    lines = stdout.splitlines()
+    assert "--settings" in lines, lines
+    payload = json.loads(lines[lines.index("--settings") + 1])
+    return payload["sandbox"]["filesystem"]["allowRead"]
+
+
+class TestSandboxGrant:
+    def test_grants_the_current_repo(self, tmp_path: Path) -> None:
+        bin_dir = tmp_path / "bin"
+        _make_fake_claude_argv(bin_dir)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
+
+        res = _run_in(repo, bin_dir)
+        assert res.returncode == 0
+        assert _granted_paths(res.stdout) == [str(repo)]
+
+    def test_grants_the_main_checkout_from_a_worktree(self, tmp_path: Path) -> None:
+        """Without it, git itself is unusable: HEAD and the object store
+        of a linked worktree live under the main checkout's `.git/`."""
+        bin_dir = tmp_path / "bin"
+        _make_fake_claude_argv(bin_dir)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
+        (repo / "README").write_text("x\n")
+        _git(repo, "add", "README")
+        _git(repo, "commit", "-m", "init")
+        wt = tmp_path / "repo.feature"
+        _git(repo, "worktree", "add", "-q", str(wt), "-b", "feature")
+
+        res = _run_in(wt, bin_dir)
+        assert res.returncode == 0
+        assert _granted_paths(res.stdout) == [str(wt), str(repo)]
+
+    def test_no_grant_outside_a_repo(self, tmp_path: Path) -> None:
+        bin_dir = tmp_path / "bin"
+        _make_fake_claude_argv(bin_dir)
+        plain = tmp_path / "plain"
+        plain.mkdir()
+
+        res = _run_in(plain, bin_dir)
+        assert res.returncode == 0
+        assert "--settings" not in res.stdout.splitlines()
